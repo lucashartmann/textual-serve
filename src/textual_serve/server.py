@@ -8,10 +8,8 @@ from pathlib import Path
 import signal
 import sys
 
-import tempfile
 from typing import Any
 
-import aiohttp
 import aiohttp_jinja2
 from aiohttp import web
 from aiohttp import WSMsgType
@@ -31,7 +29,7 @@ from .app_service import AppService
 from database import Banco
 import queue
 
-active_websockets = []
+
 frame_queue = queue.Queue(maxsize=10)
 
 log = logging.getLogger("textual-serve")
@@ -149,48 +147,31 @@ class Server:
                 return web.json_response({"status": "error", "reason": "Campo inválido"}, status=400)
 
             blob = await field.read()
-            filename = tempfile.mktemp(suffix=".jpg")
+            if self.web_meia is not None and not self.web_meia.closed:
+                try:
+                    await self.web_meia.send_bytes(blob)
+                except Exception as e:
+                    print(f"[WARN] Falha ao enviar frame: {e}")
+            else:
+                print("[INFO] WebSocket não está ativo — frame ignorado")
 
-            with open(filename, "wb") as f:
-                f.write(blob)
-
-            try:
-                chamada_em_curso = Banco.carregar(
-                    "banco.db", "chamada_em_curso")
-                chamada_em_curso[self.usuario.get_nome()] = blob
-                Banco.salvar("banco.db", "chamada_em_curso", chamada_em_curso)
-
-            except Exception as e:
-                print("Erro ao salvar no TelaInicial:", e)
-
-            return web.json_response({"status": "ok", "filename": filename})
+            return web.json_response({"status": "ok"})
 
         except Exception as e:
             import traceback
             traceback.print_exc()
             return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-    connected_clients = set()
-    ws_js = ""
+    async def acao_externa(self, request):
+        try:
+            acao = Banco.carregar("banco.db", "acao") or ""
+        except:
+            acao = ""
+        if acao:
+            return web.json_response({"status": "ok", "evento": acao})
+        else:
+            return web.json_response({"status": "error"}, status=500)
 
-    async def handle_websocket_js(self, request):
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-
-        # guarda referência do websocket para enviar mensagens depois
-        self.ws_js = ws
-
-        async for msg in ws:
-            # você pode ignorar mensagens do JS se não quiser receber nada
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                print("Mensagem recebida do JS (opcional):", msg.data)
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                print('WS connection closed with exception %s' % ws.exception())
-
-
-    async def acao_externa(self, acao):
-        await self.web_meia.send_str(acao)
-       
     async def _make_app(self) -> web.Application:
         """Make the aiohttp web.Application.
 
@@ -206,7 +187,6 @@ class Server:
             web.get("/", self.handle_index, name="index"),
             web.get("/acao_python", self.acao_externa),
             web.post("/video_frame", self.video_frame_endpoint),
-            web.get("/ws_js", self.handle_websocket_js),  
             web.get("/ws", self.handle_websocket, name="websocket"),
             web.get("/download/{key}", self.handle_download, name="download"),
             web.static("/static", self.statics_path,
@@ -367,10 +347,8 @@ class Server:
                 await app_service.blur()
             elif type_ == "focus":
                 await app_service.focus()
-                
+
     web_meia = ""
-    
-    
 
     async def handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
         """Handle the websocket that drives the remote process.
@@ -408,6 +386,7 @@ class Server:
 
         except asyncio.CancelledError:
             await websocket.close()
+            self.web_meia = None
 
         except Exception as error:
             log.exception(error)
